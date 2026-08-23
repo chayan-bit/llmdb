@@ -17,24 +17,66 @@ jobs:
       - name: Structured files parse
         run: |
           python3 - <<'PY'
-          import json, pathlib, re, sys
-          # tsconfig and friends are JSONC: comments and trailing commas are
-          # legal there and must not be reported as corruption.
-          JSONC = re.compile(r'(^|/)(tsconfig[^/]*\.json|.*\.jsonc)$')
+          import json, pathlib, sys
+
           def strip_jsonc(t):
-              t = re.sub(r'/\*.*?\*/', '', t, flags=re.S)
-              t = re.sub(r'(^|\s)//.*$', r'\1', t, flags=re.M)
-              return re.sub(r',(\s*[}\]])', r'\1', t)
+              """Remove JSONC comments and trailing commas.
+
+              Must be a scanner, not a regex: `"@/*"` in a tsconfig `paths`
+              entry looks like the start of a block comment, and the next
+              `*/` is inside `"**/*.ts"` several lines further down, so a
+              regex silently eats the middle of the file.
+              """
+              def skip_string(src, i, sink):
+                  sink.append(src[i]); i += 1
+                  while i < len(src):
+                      if src[i] == '\\':
+                          sink.append(src[i:i + 2]); i += 2; continue
+                      sink.append(src[i])
+                      if src[i] == '"':
+                          return i + 1
+                      i += 1
+                  return i
+
+              out, i, n = [], 0, len(t)
+              while i < n:
+                  if t[i] == '"':
+                      i = skip_string(t, i, out); continue
+                  if t[i] == '/' and i + 1 < n:
+                      if t[i + 1] == '/':
+                          while i < n and t[i] != '\n':
+                              i += 1
+                          continue
+                      if t[i + 1] == '*':
+                          j = t.find('*/', i + 2)
+                          i = n if j < 0 else j + 2
+                          continue
+                  out.append(t[i]); i += 1
+
+              s, res, i, n = ''.join(out), [], 0, len(''.join(out))
+              while i < n:
+                  if s[i] == '"':
+                      i = skip_string(s, i, res); continue
+                  if s[i] == ',':
+                      j = i + 1
+                      while j < n and s[j].isspace():
+                          j += 1
+                      if j < n and s[j] in '}]':
+                          i += 1; continue
+                  res.append(s[i]); i += 1
+              return ''.join(res)
+
           bad = []
-          for p in pathlib.Path('.').rglob('*.json*'):
-              s = str(p)
-              if '/.git/' in s or 'node_modules' in s or not p.is_file():
+          for p in pathlib.Path('.').rglob('*'):
+              s_ = str(p)
+              if '/.git/' in s_ or 'node_modules' in s_ or not p.is_file():
                   continue
               if p.suffix not in ('.json', '.jsonc'):
                   continue
+              jsonc = p.suffix == '.jsonc' or p.name.startswith('tsconfig')
               try:
                   raw = p.read_text(encoding='utf-8')
-                  json.loads(strip_jsonc(raw) if JSONC.search(s) else raw)
+                  json.loads(strip_jsonc(raw) if jsonc else raw)
               except Exception as e:
                   bad.append(f'{p}: {e}')
           if bad:
