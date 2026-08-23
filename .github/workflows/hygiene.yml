@@ -1,0 +1,72 @@
+# Repository hygiene. Mirrors the machine-wide pre-commit hook in
+# ~/.config/continuum/githooks, so the same rules hold for anything that
+# landed before that hook existed or was committed with --no-verify.
+name: hygiene
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Structured files parse
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, re, sys
+          # tsconfig and friends are JSONC: comments and trailing commas are
+          # legal there and must not be reported as corruption.
+          JSONC = re.compile(r'(^|/)(tsconfig[^/]*\.json|.*\.jsonc)$')
+          def strip_jsonc(t):
+              t = re.sub(r'/\*.*?\*/', '', t, flags=re.S)
+              t = re.sub(r'(^|\s)//.*$', r'\1', t, flags=re.M)
+              return re.sub(r',(\s*[}\]])', r'\1', t)
+          bad = []
+          for p in pathlib.Path('.').rglob('*.json*'):
+              s = str(p)
+              if '/.git/' in s or 'node_modules' in s or not p.is_file():
+                  continue
+              if p.suffix not in ('.json', '.jsonc'):
+                  continue
+              try:
+                  raw = p.read_text(encoding='utf-8')
+                  json.loads(strip_jsonc(raw) if JSONC.search(s) else raw)
+              except Exception as e:
+                  bad.append(f'{p}: {e}')
+          if bad:
+              print('\n'.join(bad[:40]))
+              sys.exit(f'{len(bad)} malformed JSON file(s)')
+          print('all JSON parses')
+          PY
+
+      - name: No file GitHub will reject
+        run: |
+          # 100MB is GitHub's hard limit and the only size that actually
+          # breaks a push. 10MB is the local pre-commit guideline, reported
+          # here as a warning so legitimately large content (ingested papers,
+          # datasets) does not turn the badge red.
+          fail=$(find . -path ./.git -prune -o -type f -size +100M -print)
+          warn=$(find . -path ./.git -prune -o -type f -size +10M -size -100M -print)
+          [ -n "$warn" ] && echo "$warn" | while read -r f; do
+            echo "::warning file=$f::over 10MB ($(du -h "$f" | cut -f1))"; done
+          if [ -n "$fail" ]; then
+            echo "::error::files over GitHub's 100MB limit:"; echo "$fail"; exit 1
+          fi
+          echo "no file over 100MB"
+
+      - name: No committed secrets
+        run: |
+          # Anchored at a word boundary. Without \b, "sk-" matches inside
+          # ordinary hyphenated words - "rethink-flask-a-simple-todo-list"
+          # contains a 30-character "sk-..." run and reads as an API key.
+          pat="\\b$(printf '%s' 'AKIA[0-9A-Z]{16}')|\\b$(printf '%s' 'ghp_[A-Za-z0-9]{36}')"
+          pat="$pat|\\b$(printf '%s' 'sk-[A-Za-z0-9_-]{20,}')|BEGIN [A-Z ]*PRIVATE KEY"
+          if git grep -nIE "$pat" -- . ; then
+            echo "::error::possible credential committed"
+            exit 1
+          fi
+          echo "no secret-shaped strings found"
